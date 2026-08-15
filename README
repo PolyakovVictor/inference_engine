@@ -1,0 +1,35 @@
+- prepare:
+    - install:
+        tinygrad
+
+- SCHEMA
+
+                    myollama
+                       │
+          ┌────────────┴────────────┐
+          │                         │
+      CLI client                 HTTP API
+          │                         │
+          └────────────┬────────────┘
+                       │
+                Model Manager
+                       │
+                       ▼
+                Inference Engine
+                       │
+              ┌────────┴────────┐
+              │                 │
+          Tokenizer          Model
+                                │
+                         Transformer
+                                │
+                    ┌───────────┴───────────┐
+                    │                       │
+                 Attention              MLP/FFN
+                    │                       │
+                    └───────────┬───────────┘
+                                │
+                            KV Cache
+                                │
+                                ▼
+                            Sampling
