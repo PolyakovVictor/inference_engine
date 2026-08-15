@@ -4,13 +4,12 @@
 
 - SCHEMA
 
-                    myollama
+                    engine
                        │
-          ┌────────────┴────────────┐
-          │                         │
-      CLI client                 HTTP API
-          │                         │
-          └────────────┬────────────┘
+                       │                          
+                   CLI client                     
+                       │                         
+                       ┬
                        │
                 Model Manager
                        │
