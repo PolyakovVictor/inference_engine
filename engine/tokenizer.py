@@ -1,15 +1,6 @@
 class SimpleTokenizer:
-    def __init__(self) -> None:
-        self.vocab = {
-            "<pad>": 0,
-            "<unk>": 1,
-            "hello": 2,
-            "world": 3,
-            "I": 4,
-            "am": 5,
-            "a": 6,
-            "robot": 7,
-        }
+    def __init__(self, vocab: dict) -> None:
+        self.vocab = vocab
         self.inverse_vocab = {
             v: k
             for k,v in self.vocab.items()
