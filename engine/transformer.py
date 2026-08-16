@@ -1,6 +1,7 @@
 from typing import Any
 from tinygrad.tensor import Tensor
 from tinygrad.nn import Linear
+from tinygrad.nn.state import get_state_dict, safe_save, load_state_dict, safe_load
 
 from .config import ModelConfig
 
@@ -165,3 +166,6 @@ class TinyLLM:
             tokens = tokens.cat(next_tokens.unsqueeze(1), dim=1)
             
         return tokens
+    
+    def save(self, path: str): safe_save(get_state_dict(self), path)
+    def load(self, path: str): load_state_dict(self, safe_load(path))
