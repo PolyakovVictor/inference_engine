@@ -18,8 +18,5 @@ model = TinyLLM(
 )
 
 tokens = Tensor([[11,20,30,40]])
-logits = model(tokens)
-
-print(f"token numpy: {tokens.numpy()}")
-print(f"token shape: {tokens.shape}")
-print(f"logits shape: {logits.shape}")
+result = model.generate(tokens, 10)
+print(result.numpy())

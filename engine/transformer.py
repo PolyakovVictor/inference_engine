@@ -112,7 +112,7 @@ class TinyLLM:
         self.blocks = [TransformerBlock(dim,n_heads,hidden_dim) for _ in range(n_layear)]
         self.lm_head = Linear(dim, vocab_size)
  
-    def __call__(self, tokens: Tensor) -> Any:
+    def __call__(self, tokens: Tensor) -> Tensor:
         seq_len = tokens.shape[-1]
         x = self.token_embedding[tokens]
         positions = Tensor.arange(seq_len)
@@ -120,3 +120,11 @@ class TinyLLM:
         for block in self.blocks: x = block(x)
         logits = self.lm_head(x)
         return logits
+    
+    def generate(self, tokens: Tensor, max_new_tokens: int = 20) -> Tensor:
+        for _ in range(max_new_tokens):
+            logits = self(tokens)
+            next_logits = logits[:, -1, :]
+            next_tokens = next_logits.argmax(axis=-1)
+            tokens = tokens.cat(next_tokens.unsqueeze(1), dim=1)
+        return tokens
