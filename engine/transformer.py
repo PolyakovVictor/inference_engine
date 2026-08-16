@@ -106,6 +106,8 @@ class TransformerBlock:
 
 class TinyLLM:
     def __init__(self, config: ModelConfig) -> None:
+        self.config = config
+
         self.vocab_size = config.vocab_size
         self.dim = config.dim
 
