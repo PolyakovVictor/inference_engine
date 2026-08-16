@@ -1,6 +1,6 @@
 from tinygrad.tensor import Tensor
 
-from engine.transformer import TinyLLM
+from engine.transformer import TinyLLM, SimpleTokenizer
 
 
 VOCAB_SIZE = 100
@@ -19,4 +19,7 @@ model = TinyLLM(
 
 tokens = Tensor([[11,20,30,40]])
 result = model.generate(tokens, 10)
-print(result.numpy())
+tokenizer = SimpleTokenizer()
+encoded = tokenizer.encode("hello world")
+print(encoded)
+print(tokenizer.decode(encoded))
