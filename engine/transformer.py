@@ -118,7 +118,6 @@ class TinyLLM:
         x = self.token_embedding[tokens]
         positions = Tensor.arange(seq_len)
         x = x + self.position_embedding[positions]
-        x = x.unsqueeze(1)
         for block in self.blocks: x = block(x)
         logits = self.lm_head(x)
         return logits

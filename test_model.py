@@ -17,8 +17,9 @@ model = TinyLLM(
     n_layear=LAYERS
 )
 
-tokens = Tensor([10,20,30,40])
+tokens = Tensor([[11,20,30,40]])
 logits = model(tokens)
 
+print(f"token numpy: {tokens.numpy()}")
 print(f"token shape: {tokens.shape}")
 print(f"logits shape: {logits.shape}")
