@@ -2,6 +2,8 @@ from typing import Any
 from tinygrad.tensor import Tensor
 from tinygrad.nn import Linear
 
+from .config import ModelConfig
+
 
 class SelfAttention:
     def __init__(self, dim, n_heads) -> None:
@@ -103,14 +105,14 @@ class TransformerBlock:
 
 
 class TinyLLM:
-    def __init__(self, vocab_size, dim, n_heads, hidden_dim, n_layear) -> None:
-        self.vocab_size = vocab_size
-        self.dim = dim
+    def __init__(self, config: ModelConfig) -> None:
+        self.vocab_size = config.vocab_size
+        self.dim = config.dim
 
-        self.token_embedding = Tensor.uniform(vocab_size, dim, low=-0.1, high=0.1)
-        self.position_embedding = Tensor.uniform(1024, dim, low=-0.1, high=0.1) # uniform create a tensor in HxW, from -0.1 to 0.1 values
-        self.blocks = [TransformerBlock(dim,n_heads,hidden_dim) for _ in range(n_layear)]
-        self.lm_head = Linear(dim, vocab_size)
+        self.token_embedding = Tensor.uniform(config.vocab_size, config.dim, low=-0.1, high=0.1)
+        self.position_embedding = Tensor.uniform(1024, config.dim, low=-0.1, high=0.1) # uniform create a tensor in HxW, from -0.1 to 0.1 values
+        self.blocks = [TransformerBlock(config.dim,config.n_heads,config.hidden_dim) for _ in range(config.n_layers)]
+        self.lm_head = Linear(config.dim, config.vocab_size)
  
     def __call__(self, tokens: Tensor) -> Tensor:
         seq_len = tokens.shape[-1]
