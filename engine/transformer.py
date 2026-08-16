@@ -108,12 +108,11 @@ class TinyLLM:
         self.dim = dim
 
         self.token_embedding = Tensor.uniform(vocab_size, dim, low=-0.1, high=0.1)
-        self.position_embedding = Tensor.uniform(1064, dim, low=-0.1, high=0.1)
+        self.position_embedding = Tensor.uniform(1024, dim, low=-0.1, high=0.1) # uniform create a tensor in HxW, from -0.1 to 0.1 values
         self.blocks = [TransformerBlock(dim,n_heads,hidden_dim) for _ in range(n_layear)]
         self.lm_head = Linear(dim, vocab_size)
-    
+ 
     def __call__(self, tokens: Tensor) -> Any:
-        print(tokens.shape)
         seq_len = tokens.shape[-1]
         x = self.token_embedding[tokens]
         positions = Tensor.arange(seq_len)
