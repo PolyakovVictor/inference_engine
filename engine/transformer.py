@@ -1,6 +1,7 @@
+import math
 from typing import Any
 from tinygrad.tensor import Tensor
-from tinygrad.nn import Linear
+from tinygrad.nn import Linear, Embedding
 from tinygrad.nn.state import get_state_dict, safe_save, load_state_dict, safe_load
 
 from .config import ModelConfig
@@ -90,82 +91,123 @@ class MLP:
         return x
 
 
+class RMSNorm:
+    def __init__(self, dim: int, eps: float = 1e-5) -> None:
+        self.eps = eps
+        self.weight = Tensor.ones(dim)
+    
+    def __call__(self, x: Tensor) -> Tensor:
+        variance = (x * x).mean(axis=-1, keepdim=True)
+        rsqrt = (variance + self.eps).rsqrt()
+        return x * rsqrt * self.weight
+    
+
+def apply_rotary_emb(x: Tensor, start_pos: int, theta: float = 10000.0) -> Tensor:
+    batch, seq_len, n_heads, head_dim = x.shape
+    assert head_dim % 2 == 0
+    positions = Tensor.arange(start_pos, start_pos+seq_len).reshape(seq_len, 1)
+    dim_indices = Tensor.arange(0, head_dim, 2).reshape(1, head_dim // 2)
+    freqs = positions * (theta ** (-dim_indices / head_dim)) # type: ignore
+
+    sin = freqs.sin().repeat_interleave(2, dim=-1)
+    cos = freqs.cos().repeat_interleave(2, dim=-1)
+
+    sin = sin.reshape(1, seq_len, 1, head_dim)
+    cos = cos.reshape(1, seq_len, 1, head_dim)
+    
+    x_pairs = x.reshape(batch, seq_len, n_heads, head_dim // 2, 2)
+    x1 = x_pairs[:, :, :, :, 0]
+    x2 = x_pairs[:, :, :, :, 1]
+    x_rot = Tensor.stack(-x2, x1, dim=-1).reshape(batch, seq_len, n_heads, head_dim)
+    return (x * cos) + (x_rot * sin)
+
+
+class SwiGLU:
+    def __init__(self, dim: int, hidden_dim: int) -> None:
+        self.gate_proj = Linear(dim, hidden_dim, bias=False)
+        self.up_proj = Linear(dim, hidden_dim, bias=False)
+        self.down_proj = Linear(hidden_dim, dim, bias=False)
+    
+    def __call__(self, x: Tensor) -> Tensor:
+        return self.down_proj(self.gate_proj(x).silu() * self.up_proj(x))
+
+
+class Attention:
+    def __init__(self, cfg: ModelConfig) -> None:
+        self.hidden_size = cfg.hidden_size
+        self.n_heads = cfg.num_attention_heads
+        self.n_kv_heads = cfg.num_key_value_heads
+        self.head_dim = cfg.hidden_size // self.n_heads
+        self.num_kv_groups = self.n_heads // self.n_kv_heads
+        self.rope_theta = cfg.rope_theta
+
+        self.q_proj = Linear(self.hidden_size, self.n_heads * self.head_dim, bias=False)
+        self.k_proj = Linear(self.hidden_size, self.n_kv_heads * self.head_dim, bias=False)
+        self.v_proj = Linear(self.hidden_size, self.n_kv_heads * self.head_dim, bias=False)
+        self.o_proj = Linear(self.hidden_size, self.hidden_size, bias=False)
+    
+    def __call__(self, x: Tensor, start_pos: int = 0, mask: Tensor | None = None) -> Tensor:
+        batch, seq_len, _ = x.shape
+
+        q = self.q_proj(x).reshape(batch, seq_len, self.n_heads, self.head_dim)
+        k = self.k_proj(x).reshape(batch, seq_len, self.n_kv_heads, self.head_dim)
+        v = self.v_proj(x).reshape(batch, seq_len, self.n_kv_heads, self.head_dim)
+
+        q = apply_rotary_emb(q, start_pos=start_pos, theta=self.rope_theta)
+        k = apply_rotary_emb(k, start_pos=start_pos, theta=self.rope_theta)
+
+        if self.num_kv_groups > 1:
+            k = k.repeat_interleave(self.num_kv_groups, dim=2)
+            v = v.repeat_interleave(self.num_kv_groups, dim=2)
+        
+        q = q.transpose(1,2)
+        k = k.transpose(1,2)
+        v = v.transpose(1,2)
+
+        scores = q.matmul(k.transpose(2,3)) / math.sqrt(self.head_dim)
+
+        if mask is not None:
+            scores = scores + mask
+        
+        probs = scores.softmax(axis=-1)
+        output = probs.matmul(v)
+
+        output = output.transpose(1,2).reshape(batch, seq_len, -1)
+        return self.o_proj(output)
+
+
 class TransformerBlock:
-    """
-    Базовий блок трансформера: з'єднує Attention і MLP через Residual Connections.
-    """
-    def __init__(self, dim: int, n_heads: int, hidden_dim: int) -> None:
-        self.attention = SelfAttention(dim, n_heads)
-        self.mlp = MLP(dim, hidden_dim)
+    def __init__(self, cfg: ModelConfig) -> None:
+        self.input_layernorm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.self_attn = Attention(cfg)
+        self.post_attention_layernorm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.mlp = SwiGLU(cfg.hidden_size, cfg.intermediate_size)
     
-    def __call__(self, x: Tensor) -> Any:
-        # Residual connection 1: додаємо вхід до виходу Attention
-        x = x + self.attention(x)
-        # Residual connection 2: додаємо результат до виходу MLP
-        x = x + self.mlp(x)
-        return x
+    def __call__(self, x: Tensor, start_pos: int = 0, mask: Tensor | None = None) -> Tensor:
+        h = x + self.self_attn(self.input_layernorm(x), start_pos=start_pos, mask=mask)
+        out = h + self.mlp(self.post_attention_layernorm(h))
+        return out
 
 
-class TinyLLM:
-    """
-    Головний клас декодерної мовної моделі (GPT-подібна архітектура).
-    """
-    def __init__(self, config: ModelConfig) -> None:
-        self.config = config
-        self.vocab_size = config.vocab_size
-        self.dim = config.dim
+class Transformer:
+    def __init__(self, cfg: ModelConfig) -> None:
+        self.cfg = cfg
+        self.embed_tokens =  Embedding(cfg.vocab_size, cfg.hidden_size)
+        self.layers = [TransformerBlock(cfg) for _ in range(cfg.num_hidden_layers)]
+        self.norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.lm_head = Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+    
+    def __call__(self, tokens: Tensor, start_pos: int = 0) -> Tensor:
+        batch, seq_len = tokens.shape
+        x = self.embed_tokens(tokens)
 
-        # Таблиця ембедингів для токенів [vocab_size, dim]
-        self.token_embedding = Tensor.uniform(config.vocab_size, config.dim, low=-0.1, high=0.1)
-        # Таблиця позиційних ембедингів (фіксований контекст до 1024 токенів)
-        self.position_embedding = Tensor.uniform(1024, config.dim, low=-0.1, high=0.1)
+        mask = None
+        if seq_len > 1:
+            mask = Tensor.full((seq_len, seq_len), float("-inf")).triu(1).reshape(1, 1, seq_len, seq_len)
         
-        # Стек послідовних блоків трансформера
-        self.blocks = [
-            TransformerBlock(config.dim, config.n_heads, config.hidden_dim) 
-            for _ in range(config.n_layers)
-        ]
+        for layer in self.layers:
+            x = layer(x, start_pos=start_pos, mask=mask)
         
-        # Проєкція виходу моделі назад у простір словника (отримання logits)
-        self.lm_head = Linear(config.dim, config.vocab_size)
- 
-    def __call__(self, tokens: Tensor) -> Tensor:
-        # tokens shape: [batch, seq_len]
-        seq_len = tokens.shape[-1]
+        x = self.norm(x)
+        return self.lm_head(x)
         
-        # Отримуємо векторні представлення слів за їхніми ID
-        x = self.token_embedding[tokens]
-        
-        # Генеруємо індекси позицій [0, 1, ..., seq_len - 1] та додаємо позиційні ембединги
-        positions = Tensor.arange(seq_len)
-        x = x + self.position_embedding[positions]
-        
-        # Послідовний прогін через усі трансформерні шари
-        for block in self.blocks: 
-            x = block(x)
-            
-        # Обчислюємо нескориговані ймовірності для кожного слова у словнику
-        logits = self.lm_head(x)
-        return logits
-    
-    def generate(self, tokens: Tensor, max_new_tokens: int = 20) -> Tensor:
-        """
-        Жадібна генерація (Greedy Search): на кожному кроці обирається токен з найбільшим logit.
-        """
-        for _ in range(max_new_tokens):
-            # Прогін поточної послідовності через модель
-            logits = self(tokens)
-            
-            # Беремо передбачення виключно для останнього токена в послідовності
-            next_logits = logits[:, -1, :]
-            
-            # Жадібний вибір токена з максимальною ймовірністю
-            next_tokens = next_logits.argmax(axis=-1)
-            
-            # Додаємо новий токен у кінець послідовності для наступної ітерації
-            tokens = tokens.cat(next_tokens.unsqueeze(1), dim=1)
-            
-        return tokens
-    
-    def save(self, path: str): safe_save(get_state_dict(self), path)
-    def load(self, path: str): load_state_dict(self, safe_load(path))
