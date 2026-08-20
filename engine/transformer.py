@@ -100,7 +100,12 @@ class RMSNorm:
         variance = (x * x).mean(axis=-1, keepdim=True)
         rsqrt = (variance + self.eps).rsqrt()
         return x * rsqrt * self.weight
-    
+
+def rotate_half(x: Tensor) -> Tensor:
+    d = x.shape[-1] // 2
+    x1 = x[:, :, :, :d]
+    x2 = x[:, :, :, d:]
+    return (-x2).cat(x1, dim=-1)
 
 def apply_rotary_emb(x: Tensor, start_pos: int, theta: float = 10000.0) -> Tensor:
     batch, seq_len, n_heads, head_dim = x.shape
@@ -109,17 +114,11 @@ def apply_rotary_emb(x: Tensor, start_pos: int, theta: float = 10000.0) -> Tenso
     dim_indices = Tensor.arange(0, head_dim, 2).reshape(1, head_dim // 2)
     freqs = positions * (theta ** (-dim_indices / head_dim)) # type: ignore
 
-    sin = freqs.sin().repeat_interleave(2, dim=-1)
-    cos = freqs.cos().repeat_interleave(2, dim=-1)
-
-    sin = sin.reshape(1, seq_len, 1, head_dim)
-    cos = cos.reshape(1, seq_len, 1, head_dim)
+    emb = freqs.cat(freqs, dim=-1)
     
-    x_pairs = x.reshape(batch, seq_len, n_heads, head_dim // 2, 2)
-    x1 = x_pairs[:, :, :, :, 0]
-    x2 = x_pairs[:, :, :, :, 1]
-    x_rot = Tensor.stack(-x2, x1, dim=-1).reshape(batch, seq_len, n_heads, head_dim)
-    return (x * cos) + (x_rot * sin)
+    sin = emb.sin().reshape(1, seq_len, 1, head_dim)
+    cos = emb.cos().reshape(1, seq_len, 1, head_dim)
+    return (x * cos) + (rotate_half(x) * sin)
 
 
 class SwiGLU:

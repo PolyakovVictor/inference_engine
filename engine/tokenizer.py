@@ -1,18 +1,11 @@
-class SimpleTokenizer:
-    def __init__(self, vocab: dict) -> None:
-        self.vocab = vocab
-        self.inverse_vocab = {
-            v: k
-            for k,v in self.vocab.items()
-        }
-    
-    def encode(self, text: str):
-        words = text.split()
-        return [
-            self.vocab.get(word, self.vocab["<unk>"])
-            for word in words
-        ]
-    
-    def decode(self, tokens: list):
-        words = [self.inverse_vocab.get(token, "<unk>") for token in tokens]
-        return " ".join(words)
+from pathlib import Path
+from tokenizers import Tokenizer as HFTokenizer
+
+
+class Tokenizer:
+    def __init__(self, tokenizer_path: Path | str) -> None: self.tokenizer = HFTokenizer.from_file(str(tokenizer_path))
+    def encode(self, text: str) -> list[int]: return self.tokenizer.encode(text).ids
+    def decode(self, tokens: list[int]) -> str: return self.tokenizer.decode(tokens)
+    @property
+    def eos_ids(self,) -> int | None: return self.tokenizer.token_to_id("<|im_end|>") or self.tokenizer.token_to_id("<|endoftext|>")
+ 
