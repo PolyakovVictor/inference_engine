@@ -5,31 +5,36 @@
 
 - SCHEMA
 
-                    engine
-                       │
-                       │                          
-                   CLI client                     
-                       │                         
-                       ┬
-                       │
-                Model Manager
-                       │
-                       ▼
-                Inference Engine
-                       │
-              ┌────────┴────────┐
-              │                 │
-          Tokenizer          Model
-                                │
-                         Transformer
-                                │
-                    ┌───────────┴───────────┐
-                    │                       │
-                 Attention              MLP/FFN
-                    │                       │
-                    └───────────┬───────────┘
-                                │
-                            KV Cache
-                                │
-                                ▼
-                            Sampling
+[Вхідний текст]
+       │ (Tokenizer.encode via tokenizers.json)
+       ▼
+[Token IDs] -> Tensor shape [1, seq_len]
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Transformer                                                 │
+│  1. Token Embedding: [1, seq_len] -> [1, seq_len, dim]      │
+│                                                             │
+│  2. Loop по блоках (TransformerBlock x N):                  │
+│     ├─ Input RMSNorm                                        │
+│     ├─ Self-Attention (GQA):                                │
+│     │   ├─ Q, K, V Projections                              │
+│     │   ├─ RoPE (rotate_half + freqs)                       │
+│     │   ├─ GQA repeat_interleave (якщо n_kv_heads < n_heads)│
+│     │   ├─ Causal Mask + Scaled Dot-Product Softmax         │
+│     │   └─ Output Projection (o_proj)                       │
+│     ├─ (+) Residual Connection                              │
+│     ├─ Post-Attention RMSNorm                               │
+│     ├─ SwiGLU MLP:                                          │
+│     │   └─ down_proj(silu(gate_proj(x)) * up_proj(x))       │
+│     └─ (+) Residual Connection                              │
+│                                                             │
+│  3. Final RMSNorm                                           │
+│  4. LM Head (Linear): [1, seq_len, dim] -> [1, seq_len, V] │
+└─────────────────────────────────────────────────────────────┘
+       │
+       ▼
+Logits останнього токена: logits[:, -1, :]
+       │ (argmax)
+       ▼
+Next Token ID -> Додається до масиву токенів -> Повний повтор циклу
