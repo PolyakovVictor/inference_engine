@@ -20,6 +20,7 @@ class Runtime:
         self.load_weights()
         self.max_context = self.config.max_position_embeddings
         self._jit_decode = TinyJit(self._decode_step)
+        self.start_pos = 0
 
     def _decode_step(self, tokens: Tensor, start_pos: Any):
         return self.model(tokens=tokens, start_pos=start_pos).realize()
@@ -36,36 +37,35 @@ class Runtime:
         probs = (logits / temperature).softmax(axis=-1)
         return int(probs.multinomial().item())
 
-    def generate(self, prompt: str, max_new_tokens: int = 50) -> str:
-        self.model.reset_cache()
-        tokens = self.tokenizer.encode(prompt)
+    def start_conversation(self) -> None: self.model.reset_cache(); self.start_pos = 0
+
+    def generate(self, delta_text: str, max_new_tokens: int = 50) -> str:
+        add_bos = (self.start_pos == 0)
+        tokens = self.tokenizer.encode(delta_text, add_bos=add_bos)
+        if not tokens: return ""
         input_tensor = Tensor([tokens])
-        logits = self.model(input_tensor, start_pos=0)
+        logits = self.model(input_tensor, start_pos=self.start_pos)
+        self.start_pos += len(tokens)
         next_tokens = self.sample(logits[0,-1])
 
         generated = [next_tokens]
-        start_pos = len(tokens)
 
-        if DEBUG > 0: print(f"[DEBUG] Initial tokens: {tokens}")
+        if DEBUG > 0: print(f"[DEBUG] Prefill tokens: {tokens}, start_pos now: {self.start_pos}")
         for _ in range(max_new_tokens):
             if next_tokens in self.tokenizer.eos_ids:
                 break
             input_tensor = Tensor([[next_tokens]])
-            var = Variable("start_pos", 1, self.max_context).bind(start_pos)
+            var = Variable("start_pos", 1, self.max_context).bind(self.start_pos)
             logits = self._jit_decode(input_tensor, var)
             next_tokens = self.sample(logits[0,-1])
  
             generated.append(next_tokens)
-            start_pos += 1
+            self.start_pos += 1
         return self.tokenizer.decode(generated)
  
-    def format_chat(self, messages: list[dict], add_generation_prompt: bool = True) -> str:
-        parts = []
-        for m in messages:
-            role = m["role"]
-            if role not in ("user", "system", "assistant"): continue
-            tag = {"user": "<|user|>", "system": "<|system|>", "assistant": "<|assistant|>"}[role]
-            parts.append(f"{tag}\n{m['content']}</s>\n")
+    def format_turn(self, role: str, content: str, add_generation_prompt: bool = True) -> str:
+        tag = {"user": "<|user|>", "system": "<|system|>", "assistant": "<|assistant|>"}[role]
+        text = f"{tag}\n{content}</s>\n"
         if add_generation_prompt:
-            parts.append("<|assistant|>\n")
-        return "".join(parts)
+            text += "<|assistant|>\n"
+        return text

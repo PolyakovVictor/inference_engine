@@ -7,18 +7,20 @@ START_TIME = time.time()
 MODEL_PATH = "models/tinyllama"
 
 runtime = Runtime(MODEL_PATH)
-messages = [
-    {"role": "system", "content": "You are a helpful assistant."}
-]
-while 1:
-    print(runtime.tokenizer.tokenizer.encode("hello").ids[:3])
+runtime.start_conversation()
+system_prompt = "You are a helpful assistant."
+first_turn = True
+while True:
     user_prompt = input("Enter a prompt:") 
-    messages.append({"role": "user", "content": user_prompt})
-    prompt = runtime.format_chat(messages=messages)
-    output = runtime.generate(prompt=prompt, max_new_tokens=40)
+    if first_turn:
+        delta = runtime.format_turn("system", system_prompt) + runtime.format_turn("user", user_prompt, add_generation_prompt=True)
+        first_turn = False
+    else:
+        delta = runtime.format_turn("user", user_prompt, add_generation_prompt=True)
+    output = runtime.generate(delta_text=delta, max_new_tokens=100)
 
     print("\n--- Output ---")
     print(output)
-    messages.append({"role": "assistant", "content": output})
+    runtime.generate(delta_text=runtime.format_turn("assistant", output).removesuffix("<|assistant|>\n"), max_new_tokens=0)
 
     print(f"\n--- Time: {time.time() - START_TIME} ---")

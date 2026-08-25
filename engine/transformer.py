@@ -136,7 +136,9 @@ class Transformer:
 
         mask = None
         if seq_len > 1:
-            mask = Tensor.full((seq_len, seq_len), float("-inf")).triu(1).reshape(1, 1, seq_len, seq_len)
+            past_mask = Tensor.zeros(seq_len, start_pos)
+            causal_mask = Tensor.full((seq_len, seq_len), float("-inf")).triu(1)
+            mask = past_mask.cat(causal_mask, dim=-1).reshape(1,1,seq_len,start_pos+seq_len)
         
         for layer in self.layers:
             x = layer(x, start_pos=start_pos, mask=mask)
