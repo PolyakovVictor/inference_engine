@@ -41,7 +41,7 @@ class Runtime:
         tokens = self.tokenizer.encode(prompt)
         input_tensor = Tensor([tokens])
         logits = self.model(input_tensor, start_pos=0)
-        next_tokens = int(logits[0,-1].argmax().item())
+        next_tokens = self.sample(logits[0,-1])
 
         generated = [next_tokens]
         start_pos = len(tokens)
@@ -57,4 +57,15 @@ class Runtime:
  
             generated.append(next_tokens)
             start_pos += 1
-        return self.tokenizer.decode(tokens + generated)
+        return self.tokenizer.decode(generated)
+ 
+    def format_chat(self, messages: list[dict], add_generation_prompt: bool = True) -> str:
+        parts = []
+        for m in messages:
+            role = m["role"]
+            if role not in ("user", "system", "assistant"): continue
+            tag = {"user": "<|user|>", "system": "<|system|>", "assistant": "<|assistant|>"}[role]
+            parts.append(f"{tag}\n{m['content']}</s>\n")
+        if add_generation_prompt:
+            parts.append("<|assistant|>\n")
+        return "".join(parts)
