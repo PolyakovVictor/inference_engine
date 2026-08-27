@@ -1,3 +1,4 @@
+import os
 import time
 import sys
 
@@ -5,6 +6,7 @@ from engine.runtime import Runtime
 
 START_TIME = time.time()
 MODEL_PATH = "models/tinyllama"
+TOKENS = int(os.getenv("TOKENS", 100))
 
 runtime = Runtime(MODEL_PATH)
 runtime.start_conversation()
@@ -18,7 +20,7 @@ while True:
     else:
         delta = runtime.format_turn("user", user_prompt, add_generation_prompt=True)
     print(f"Delta: {delta}")
-    output = runtime.generate(user_text=delta, max_new_tokens=100)
+    output = runtime.generate(user_text=delta, max_new_tokens=TOKENS)
 
     print("\n--- Output ---")
     print(output)

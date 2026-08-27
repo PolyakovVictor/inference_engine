@@ -109,6 +109,7 @@ class Agent:
 
         prompt = user_query
 
+        failed = 0
         for step_num in range(1, self.max_steps + 1):
             print(f"\n --- Agent step {step_num} ---")
 
@@ -123,6 +124,7 @@ class Agent:
                 return step.final_answer
             
             if step.action:
+                failed = 0
                 tool_name = step.action.lower()
                 raw_input = (step.action_input or "").strip()
 
@@ -138,11 +140,13 @@ class Agent:
                 print(f"Observation: {observation}")
                 prompt = f"Observation: {observation}"
                 continue
+            failed += 1
+            if failed >= 2: "Hello! I can calculate example, show current time and weather"
             print("[Agent] failed to parse Action or Final Answer")
             prompt = (
-                "You've violated the format. Please answer strictly in this format:"
-                "Thought: ...\nAction: ...\nAction Input: ...\n"
-                "or\nThought: ...\nFinal Answer: ..."
+                "Answer ONLY in this format:\n"
+                "Thought: greeting\n"
+                "Final Answer: Hello!"
             )
         return "The agent exceeded the maximum number of steps and was unable to provide a response."
 # where tinygrad save a model from example?
