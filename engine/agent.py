@@ -81,7 +81,7 @@ def parse_react_output(text: str) -> AgentStep:
         return step
     cleaned = text.strip()
     bad_markers = ("SCOPING", "```", "Write a", "Sure, here", "multiplication table")
-    if cleaned and len(cleaned) < 120 and not any(b.lower())
+    if cleaned and len(cleaned) < 120 and not any(b.lower() in cleaned.lower() for b in bad_markers) and "Action:" not in cleaned:
         step.final_answer = cleaned
         return step
     return step
