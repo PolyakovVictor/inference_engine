@@ -55,6 +55,9 @@ class AgentStep:
     final_answer: str | None = None
     raw: str = ""
 
+def looks_like_math(text: str) -> bool:
+    return bool(re.search(r"\d+\s*[\+\-\*/×x]\s*\d+", text))
+
 def parse_react_output(text: str) -> AgentStep:
     step = AgentStep(raw=text.strip())
 
@@ -92,7 +95,13 @@ class Agent:
         self.runtime = runtime
         self.max_steps = max_steps
     
-    def run(self, user_query: str, temperature: float = 0.3) -> str:
+    def run(self, user_query: str, temperature: float = 0.2) -> str:
+        if looks_like_math(user_query):
+            expr = re.search(r"(\d+\s*[\+\-\*/×x]\s*\d+(?:\s*[\+\-\*/×x]\s*\d+)*)", user_query)
+            if expr:
+                expression = expr.group(1).replace("×", "*").replace("×", "*")
+                result = call_tool("calculator", expression=expression)
+                return f"{expression} = {result}"
         system = REACT_SYSTEM.format(tools=get_tools_prompt())
         self.runtime.start_conversation(system_prompt=system)
 
