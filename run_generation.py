@@ -17,10 +17,11 @@ while True:
         first_turn = False
     else:
         delta = runtime.format_turn("user", user_prompt, add_generation_prompt=True)
-    output = runtime.generate(delta_text=delta, max_new_tokens=100)
+    print(f"Delta: {delta}")
+    output = runtime.generate(user_text=delta, max_new_tokens=100)
 
     print("\n--- Output ---")
     print(output)
-    runtime.generate(delta_text=runtime.format_turn("assistant", output).removesuffix("<|assistant|>\n"), max_new_tokens=0)
+    runtime.generate(user_text=runtime.format_turn("assistant", output).removesuffix("<|assistant|>\n"), max_new_tokens=0)
 
     print(f"\n--- Time: {time.time() - START_TIME} ---")
