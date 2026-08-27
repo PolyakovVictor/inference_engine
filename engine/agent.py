@@ -58,6 +58,16 @@ class AgentStep:
 def looks_like_math(text: str) -> bool:
     return bool(re.search(r"\d+\s*[\+\-\*/×x]\s*\d+", text))
 
+def looks_like_time(text: str) -> bool:
+    t = text.lower()
+    keys = ["time", "what time", "clock"]
+    return any(k in t for k in keys)
+
+def looks_like_weather(text: str) -> bool:
+    t = text.lower()
+    keys = ["weather"]
+    return any(k in t for k in keys)
+
 def parse_react_output(text: str) -> AgentStep:
     step = AgentStep(raw=text.strip())
 
