@@ -8,6 +8,7 @@ from engine.tools import call_tool, get_tools_prompt
 
 
 REACT_SYSTEM = """You are a tool-using assistant. Answer ONLY in one of two formats.
+
 Format 1 (need tool):
 Thought: brief
 Action: tool_name
@@ -23,28 +24,19 @@ Tools:
 Examples:
 
 User: What is 12 * 8?
-Thought: need to calculate
+Thought: need calculate
 Action: calculator
 Action Input: 12 * 8
 
 User: Observation: 96
-Thought: got the result
+Thought: done
 Final Answer: 12 * 8 = 96
 
-User: What time is it?
-Thought: need time
-Action: current_time
-Action Input:
-
-User: Observation: 2026-08-26 13:05:00
-Thought: have time
-Final Answer: Now 2026-08-26 13:05:00
-
 User: Hello
-Thought: Simple question
+Thought: greeting
 Final Answer: Hello! How can I help?
 
-Never write code, tables, or long explanations. Only the above format.
+Never write code, websites, tables, or long text. Only the format above.
 """
 
 @dataclass
