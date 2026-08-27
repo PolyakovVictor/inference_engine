@@ -220,4 +220,4 @@ __marimo__/
 .streamlit/secrets.toml
 models/
 tinygrad/
-
+.DS_Store
