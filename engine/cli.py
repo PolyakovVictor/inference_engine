@@ -107,6 +107,9 @@ def main(): # TODO make choose model via list of models
     agent_parser.add_argument("model", type=str, help="Path to folder with model")
     agent_parser.add_argument("--temp", type=float, default=0.3, help="Temperature (for agent lower is better)")
     agent_parser.add_argument("--max-steps", type=int, default=6, help="ReAct-cicle max steps")
+    agent_parser.add_argument("--project", type=str, default=".", help="Project root for fs/git tools")
+    agent_parser.add_argument("--yes", action="store_true", help="Auto-confirm CONFIRM-risk tool")
+    
     
 
     args = parser.parse_args()
@@ -123,7 +126,7 @@ def main(): # TODO make choose model via list of models
         runtime.start_conversation(system_prompt=args.system)
         chat_loop(runtime, temperature=args.temp)
     elif args.command == "agent":
-        agent = Agent(runtime, max_steps=args.max_steps)
+        agent = Agent(runtime, max_steps=args.max_steps, project_root=args.project, auto_confirm=args.yes)
         agent_loop(agent, temperature=args.temp)
 
 
