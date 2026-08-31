@@ -6,14 +6,35 @@ from tinygrad.engine.jit import TinyJit
 from tinygrad.tensor import Tensor
 from tinygrad.nn.state import safe_load, load_state_dict
 
-from engine.helper import DEBUG
+from engine.helper import DEBUG, resolve_chat_template
 from engine.transformer import Transformer
 from engine.tokenizer import Tokenizer
 from engine.config import ModelConfig
 
 
+CHAT_TEMPLATES = {
+    "legacy": {
+        "system": "<|system|>\n{content}</s>\n",
+        "user":   "<|user|>\n{content}</s>\n",
+        "assistant": "<|assistant|>\n{content}</s>\n",
+        "generation_prompt": "<|assistant|>\n",
+    },
+    "chatml": {
+        "system": "<|im_start|>system\n{content}<|im_end|>\n",
+        "user":   "<|im_start|>user\n{content}<|im_end|>\n",
+        "assistant": "<|im_start|>assistant\n{content}<|im_end|>\n",
+        "generation_prompt": "<|im_start|>assistant\n",
+    },
+    "llama3": {
+        "system": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{content}<|eot_id|>",
+        "user":   "<|start_header_id|>user<|end_header_id|>\n\n{content}<|eot_id|>",
+        "assistant": "<|start_header_id|>assistant<|end_header_id|>\n\n{content}<|eot_id|>",
+        "generation_prompt": "<|start_header_id|>assistant<|end_header_id|>\n\n",
+    },
+}
+
 class Runtime:
-    def __init__(self, model_path: str | Path) -> None:
+    def __init__(self, model_path: str | Path, chat_template: str | None = None) -> None:
         self.model_dir = Path(model_path)
         self.config = ModelConfig.from_json(self.model_dir / "config.json")
         self.tokenizer = Tokenizer(self.model_dir / "tokenizer.json")
@@ -23,6 +44,9 @@ class Runtime:
         self._jit_decode = TinyJit(self._decode_step)
         self.start_pos = 0
         self.messages: list[dict[str, str]] = []
+        if chat_template is not None and chat_template not in CHAT_TEMPLATES: raise ValueError(f"Unknown chat_template: {chat_template}. Available: {list(CHAT_TEMPLATES)}")
+        self.chat_template = CHAT_TEMPLATES[chat_template or resolve_chat_template(self.model_dir)]
+        self.chat_template_name = chat_template
 
     def _decode_step(self, tokens: Tensor, start_pos: Any) -> Tensor:
         return self.model(tokens=tokens, start_pos=start_pos).realize()
@@ -80,10 +104,9 @@ class Runtime:
         return response
  
     def format_turn(self, role: str, content: str, add_generation_prompt: bool = False) -> str:
-        tag = {"user": "<|user|>", "system": "<|system|>", "assistant": "<|assistant|>"}[role]
-        text = f"{tag}\n{content}</s>\n"
-        if add_generation_prompt:
-            text += "<|assistant|>\n"
+        if role not in ("system", "user", "assistant"): raise ValueError(f"Unknown role: {role}")
+        text = self.chat_template[role].format(content=content)
+        if add_generation_prompt: text += self.chat_template["generation_prompt"]
         return text
 
     def add_message(self, role: str, content: str) -> None:
