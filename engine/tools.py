@@ -11,6 +11,7 @@ from engine.permission import RiskLevel
 from engine.tools_fs import FsTools
 from engine.security import SandBox
 import engine.tools_shell as shell
+import engine.tools_cv as cv
 
 
 @dataclass
@@ -88,6 +89,10 @@ def build_tools(sandbox: SandBox) -> dict[str, Tool]:
                             "path: str", RiskLevel.CONFIRM, ["path"]),
             "git_commit": Tool("git_commit", "git commit -m <message>", lambda message: shell.git(["commit", "-m", message], root),
                                 "message: str", RiskLevel.CONFIRM, ["message"]),
+            "capture_screen": Tool("capture_screen", "Make a screenshot of the screen or region and describe it", lambda region="full": cv.capture_screen(region),
+                                    "region: str (full or x,y,w,h)", RiskLevel.SAFE, ["region"]),
+            "mouse_click": Tool("mouse_click", "Click mouse at coordinates", lambda x, y, button="left": cv.mouse_click(x, y, button),
+                                "x: int, y: int, button: str", RiskLevel.CONFIRM, ["x", "y", "button"]),
         }
 
 def get_tools_prompt(tools: dict[str, Tool]) -> str:

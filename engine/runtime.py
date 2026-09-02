@@ -1,13 +1,22 @@
+import os
+os.environ["DEFAULT_FLOAT"] = "half"
+
+import json, os
+
 from typing import Any
 from pathlib import Path
 
-from tinygrad import Variable
+from tinygrad import Variable, Context, Device
+from tinygrad.dtype import dtypes
 from tinygrad.engine.jit import TinyJit
 from tinygrad.tensor import Tensor
-from tinygrad.nn.state import safe_load, load_state_dict
+from tinygrad.llm.gguf import gguf_load
+from tinygrad.nn.state import safe_load, load_state_dict, torch_load
+from tinygrad.extra.models.llama import convert_from_huggingface, convert_from_gguf, fix_bf16
+from tinygrad.extra.models.llama import Transformer as TinyTransofrmer
 
 from engine.helper import DEBUG, resolve_chat_template
-from engine.transformer import Transformer
+from engine.transformer import Transformer, Int8Linear
 from engine.tokenizer import Tokenizer
 from engine.config import ModelConfig
 
@@ -32,6 +41,8 @@ CHAT_TEMPLATES = {
         "generation_prompt": "<|start_header_id|>assistant<|end_header_id|>\n\n",
     },
 }
+
+
 
 class Runtime:
     def __init__(self, model_path: str | Path, chat_template: str | None = None) -> None:
@@ -58,17 +69,86 @@ class Runtime:
         self.start_pos += len(tokens)
         if DEBUG > 0: print(f"[DEBUG] Fed {len(tokens)} tokens, start_post now = {self.start_pos}")
         return logits
+    
+    def concat_weights(self, models, device=None):
+        def convert(name) -> Tensor:
+            disk_tensors: list[Tensor] = [model[name] for model in models]
+            if len(disk_tensors) == 1 or len(disk_tensors[0].shape) == 1:
+                return disk_tensors[0].to(device=device)
+            axis = 1 if name.endswith((".attention.wo.weight", ".feed_forward.w2.weight")) else 0
+            lazy_tensors = [data.to(device=device) for data in disk_tensors]
+            return lazy_tensors[0].cat(*lazy_tensors[1:], dim=axis)
+        return {name: convert(name) for name in {name: None for model in models for name in model}}
+
+    def load(self, fn:str):
+        if fn.endswith('.index.json'):
+            with open(fn) as fp: weight_map = json.load(fp)['weight_map']
+            parts = {n: self.load(str(Path(fn).parent / Path(n).name)) for n in set(weight_map.values())}
+            return {k: parts[n][k] for k, n in weight_map.items()}
+        elif fn.endswith(".gguf"):
+            gguf_tensor = Tensor.empty(os.stat(fn).st_size, dtype=dtypes.uint8, device=f"disk:{fn}").to(Device.DEFAULT)
+            return gguf_load(gguf_tensor)[1]
+        elif fn.endswith(".safetensors"):
+            return safe_load(fn)
+        else:
+            return torch_load(fn)
 
     def load_weights(self) -> None:
-        state_dict = safe_load(str(self.model_dir / "model.safetensors"))
-        cleaned_state = {k.removeprefix("model."): v for k,v in state_dict.items()}
-        if "lm_head.weight" not in cleaned_state and "embed_tokens.weight" in cleaned_state:
-            cleaned_state["lm_head.weight"] = cleaned_state["embed_tokens.weight"]
-        load_state_dict(self.model, cleaned_state, strict=False)
-    
+        if self.model_dir.is_dir():
+            if (self.model_dir / "model.safetensors.index.json").exists(): 
+                weights = self.load(str(self.model_dir / "model.safetensors.index.json"))
+            elif (self.model_dir / "model.safetensors").exists(): 
+                weights = self.load(str(self.model_dir / "model.safetensors"))
+            else: raise FileNotFoundError(...)
+            # else: weights = self.concat_weights([self.load(str(self.model_dir / f"consolidated.{i:02d}.pth")) for i in range(MODEL_PARAMS[model_size]["files"])], device[0] if isinstance(device, tuple) else device)
+        else:
+            weights = self.load(str(self.model_dir))
+        if any(k.startswith("model.") for k in weights):
+            cleaned = {}
+            for k,v in weights.items():
+                cleaned[k.removeprefix("model.")] = v
+            weights = cleaned
+        
+        if "lm_head.weight" not in weights and "embed_tokens.weight" in weights: 
+            weights["lm_head.weight"] = weights["embed_tokens.weight"]
+
+        print("Streaming and quantizing weights tensor-by-tensor...")
+        quantized_weights = {}
+
+        for k, v in weights.items():
+            v_real = v.to(Device.DEFAULT).realize()
+            
+            v_real = fix_bf16({k: v_real})[k]
+
+            is_linear = any(x in k for x in ["self_attn", "mlp", "lm_head"])
+            
+            if is_linear and k.endswith(".weight"):
+                # 2. Квантуємо на льоту
+                v_real = v_real.cast(dtypes.float16)
+                scale = v_real.abs().max(axis=1) / 127.0
+                int8_weight = (v_real.T / scale).T.round().cast(dtype=dtypes.int8).contiguous().realize()
+                scale_real = scale.contiguous().realize()
+
+                quantized_weights[k] = int8_weight
+                quantized_weights[k.replace('.weight', '.scale')] = scale_real
+            else:
+                quantized_weights[k] = v_real.cast(dtypes.float16).contiguous().realize()
+
+            del v_real
+            del v
+        
+        del weights
+
+        print("Weights quantized and loaded to RAM/GPU.")
+        load_state_dict(self.model, quantized_weights, strict=False, consume=True, realize=False)
+
     def sample(self, logits: Tensor, temperature: float = 0.7) -> int:
-        if temperature == 0: return int(logits.argmax().item())
-        probs = (logits / temperature).softmax(axis=-1)
+        print(f"[sample] logits.shape={logits.shape} dtype={logits.dtype}")
+        flat = logits[0,1] if logits.ndim == 3 else logits
+        print(f"[sample] flat.shape={flat.shape}")
+        flat = flat.cast(dtypes.float32).contiguous().reshape(-1)
+        if temperature <= 1e-5: return int(flat.argmax().item())
+        probs = (flat / temperature).softmax(axis=-1)
         return int(probs.multinomial().item())
 
     def start_conversation(self, system_prompt: str | None = None) -> None:
@@ -84,8 +164,11 @@ class Runtime:
 
         if not tokens: return ""
         logits = self._feed_tokens(tokens)
+        print(f"[generate] model logits shape = {logits.dtype}")
         assert logits is not None
-        next_tokens = self.sample(logits[0,-1], temperature=temperature)
+        logits = logits.cast(dtypes.float16).contiguous().realize()
+        print("logits realized successfully")
+        next_tokens = self.sample(logits, temperature=temperature)
         generated: list[int] = [next_tokens]
 
         if DEBUG > 0: print(f"[DEBUG] Prefill tokens: {tokens}, start_pos now: {self.start_pos}")

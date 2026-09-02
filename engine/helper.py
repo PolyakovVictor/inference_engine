@@ -9,7 +9,7 @@ def resolve_chat_template(model_dir: Path | str) -> str:
     name = model_dir.name.lower()
     templates = {
         'chatml': ['chatml', 'qwen'],
-        'llama3': ['llama3', 'llama-3'],
+        'llama3': ['llama3', 'llama-3', 'llama-3-8b'],
     }
     for k,v in templates.items():
         if name in v: return k

@@ -5,7 +5,7 @@ import sys
 from engine.runtime import Runtime
 
 START_TIME = time.time()
-MODEL_PATH = "models/tinyllama"
+MODEL_PATH = "models/Llama-3-8B"
 TOKENS = int(os.getenv("TOKENS", 100))
 
 runtime = Runtime(MODEL_PATH)
