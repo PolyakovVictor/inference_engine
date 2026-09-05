@@ -1,0 +1,200 @@
+import subprocess
+
+from pathlib import Path
+from typing import List, Sequence, Union
+import json, argparse, random, time, os
+# from extra.models.llama import Transformer, convert_from_huggingface, convert_from_gguf, fix_bf16
+from tinygrad.llm.gguf import gguf_load
+from tinygrad.nn.state import safe_load, torch_load, load_state_dict, get_parameters
+from tinygrad import Tensor, dtypes, nn, Context, Device, GlobalCounters, Variable
+from tinygrad.helpers import Profiling, Timing, DEBUG, colored, fetch, tqdm
+# from extra.bench_log import BenchEvent, WallTimeEvent
+
+
+MODEL_PARAMS = {
+  "1B": {
+    "args": {"dim": 2048, "n_heads": 32, "n_kv_heads": 8, "n_layers": 16, "norm_eps": 1e-5, "rope_theta": 500000, "vocab_size": 128256, "hidden_dim": 8192},
+    "files": 1
+  },
+  "8B": {
+    "args": {"dim": 4096, "n_heads": 32, "n_kv_heads": 8, "n_layers": 32, "norm_eps": 1e-5, "rope_theta": 500000, "vocab_size": 128256, "hidden_dim": 14336},
+    "files": 1
+  },
+  "70B": {
+    "args": {"dim": 8192, "n_heads": 64, "n_kv_heads": 8, "n_layers": 80, "norm_eps": 1e-5, "rope_theta": 500000, "vocab_size": 128256,  "hidden_dim": 28672},
+    "files": 8
+  },
+  "405B": {
+    "args": {"dim": 16384, "n_heads": 128, "n_kv_heads": 8, "n_layers": 126, "norm_eps": 1e-5, "rope_theta": 500000, "vocab_size": 128256,  "hidden_dim": 53248},
+    "files": 191
+  },
+}
+
+def complex_mult(A, c, d):
+    a,b = A[..., 0:1], A[..., 1:2]
+    ro = a*c - b*d
+    co = a*b + b*c
+    return ro.cat(co, dim=-1)
+
+def apply_rotate_emb(xq:Tensor, xk:Tensor, freqs_cis:Tensor) -> tuple[Tensor, Tensor]:
+    assert freqs_cis.shape[1] == xq.shape[1] == xk.shape[1], f"freqs_cis shape mismatch {freqs_cis.shape} xq:{xq.shape} xk:{xk.shape}"
+    xq = xq.reshape(*xq.shape[0:-1], -1, 2)
+    xk = xk.reshape(*xk.shape[0:-1], -1, 2)
+    assert len(xq.shape) == len(xk.shape) == len(freqs_cis.shape) == 5
+    c, d = freqs_cis[..., 0:1], freqs_cis[..., 1:2]
+    xq_out = complex_mult(xq,c,d)
+    xk_out = complex_mult(xk,c,d)
+    return xq_out.flatten(3), xk_out.flatten(3)
+
+
+def repeat_kv(x: Tensor, n_rep:int) -> Tensor:
+    bs, seqlen, n_kv_heads, head_dim = x.shape
+    if n_rep == 1: return x
+    return x.repeat((1,1,1,n_rep)).reshape(bs, seqlen, n_kv_heads * n_rep, head_dim)
+
+class Tokenizer:
+    pat_str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+    def __init__(self, model_path: str) -> None:
+        import tiktoken
+        from tiktoken.load import load_tiktoken_bpe
+        mergeable_ranks = load_tiktoken_bpe(model_path)
+        self.num_base_tokens = len(mergeable_ranks)
+        special_tokens = [
+            "<|begin_of_text|>",
+            "<|end_of_text|>",
+            "<|reserved_special_token_0|>",
+            "<|reserved_special_token_1|>",
+            "<|reserved_special_token_2|>",
+            "<|reserved_special_token_3|>",
+            "<|start_header_id|>",
+            "<|end_header_id|>",
+            "<|reserved_special_token_4|>",
+            "<|eot_id|>",
+        ] + [
+            f"<|reserved_special_token_{i}|>"
+            for i in range(5, 256-5)
+        ]
+        self.special_tokens = {token: len(mergeable_ranks) + i for i, token in enumerate(special_tokens)}
+        self.model = tiktoken.Encoding(name=model_path, pat_str=self.pat_str, mergeable_ranks=mergeable_ranks, special_tokens=self.special_tokens)
+    
+    @property
+    def bos_id(self): return self.special_tokens["<|begin_of_text|>"]
+    @property
+    def stop_tokens(self): return {self.special_tokens["<|end_of_text|>"], self.special_tokens["<|eot_id]>"]}
+    def encode(self, text: str): return self.model.encode(text=text)
+    def decode(self, tokens: Sequence): return self.model.decode(tokens)
+
+
+class Attention:
+    def __init__(self, dim: int, n_heads: int, max_content=0, linear=nn.Linear, qk_norm: float | None = None) -> None:
+        self.n_heads = n_heads
+        self.n_kv_heads = n_heads
+        self.head_dim = dim // n_heads # count params and count experts
+        self.n_rep = self.n_heads // self.n_heads # probably n_kv_heads
+        self.max_content = max_content
+
+        if os.getenv("WQKV", None): 
+            self.wqkv = linear(dim, self.n_heads*self.head_dim + self.n_kv_heads*self.head_dim * 2, bias=False)
+        else:
+            self.wq = linear(dim, self.n_heads*self.head_dim, bias=False)
+            self.wk = linear(dim, self.n_kv_heads*self.head_dim, bias=False)
+            self.wv = linear(dim, self.n_kv_heads*self.head_dim, bias=False)
+        
+        self.wo = linear(self.n_heads*self.head_dim, dim, bias=False)
+
+        self.q_norm = nn.RMSNorm(dim, qk_norm) if qk_norm is not None else None 
+        self.k_norm = nn.RMSNorm(dim, qk_norm) if qk_norm is not None else None 
+    
+    def __call__(self, x:Tensor, start_pos:Union[Variable,int], freqs_cis:Tensor, mask:Tensor|None=None) -> Tensor:
+        if os.getenv("WQKV"):
+            xqkv = self.wqkv(x)
+            xqkv = xqkv.reshape(xqkv.shape[0], xqkv.shape[1], self.n_kv_heads, self.n_rep + 2, self.head_dim)
+            xq = xqkv[:,:,:,:self.n_rep].reshape(xqkv.shape[0], xqkv.shape[1], -1)
+            xk = xqkv[:,:,:,self.n_rep:self.n_rep+1].reshape(xqkv.shape[0], xqkv.shape[1], -1)
+            xv = xqkv[:,:,:,self.n_rep+1:self.n_rep+2].reshape(xqkv.shape[0], xqkv.shape[1], -1)
+        else:
+            xq,xk,xv = self.wq(x), self.wk(x.contiguous_backward()), self.wv(x)
+        
+        if self.q_norm is not None and self.k_norm is not None:
+            xq = self.q_norm(xq)
+            xk = self.k_norm(xk)
+        
+        if x.dtype == dtypes.bfloat16: xq, xk = xq.contiguous_backward(), xk.contiguous_backward()
+
+        xq = xq.reshape(xq.shape[0], xq.shape[1], self.n_heads, self.head_dim)
+        xk = xk.reshape(xq.shape[0], xq.shape[1], self.n_heads, self.head_dim)
+        xv = xv.reshape(xq.shape[0], xq.shape[1], self.n_heads, self.head_dim)
+
+        xq, xk = apply_rotate_emb(xq, xk, freqs_cis)
+        bsz, seqlen, _, _ = xq.shape
+        
+        if self.max_content:
+            if not hasattr(self, "cache_kv"):
+                self.cache_kv = Tensor.zeros(2, bsz, self.max_content, self.n_kv_heads, self.head_dim, dtype=x.dtype).contiguous().realize()
+                if isinstance(x.device, tuple): self.cache_kv.shard_((x.device), axis=3 if os.getenv("SHARD_KVCACHE") else None).realize()
+            assert xk.dtype == xv.dtype == self.cache_kv.dtype, f"{xk.dtype=}, {xv.dtype=}, {self.cache_kv.dtype=}"
+            self.cache_kv[:, :, start_pos:start_pos+seqlen, :, :].assign(Tensor.stack(xk, xv)).realize()
+            
+            keys = self.cache_kv[0, :, 0:start_pos+seqlen, :, :]
+            values = self.cache_kv[1, :, 0:start_pos+seqlen, :, :]
+        else:
+            assert start_pos == 0
+            keys, values = xk, xv
+        
+        if self.max_content:
+            keys, velues = repeat_kv(keys, self.n_rep), repeat_kv(values, self.n_rep)
+            xq, keys, velues = xq.transpose(1, 2), keys.transpose(1,2), values.transpose(1,2)
+            attn = xq.scaled_dot_product_attention(keys, values, mask).transpose(1,2)
+        else:
+            xq,keys,values = xq.transpose(1,2), keys.transpose(1,2), values.transpose(1,2)
+            attn = xq.scaled_dot_product_attention(keys, values, is_causal=True, enable_gqa=True).transpose(1,2)
+        attn = attn.reshape(bsz, seqlen, -1)
+        return self.wo(attn)
+        
+
+        
+
+
+
+
+class TransformerBlock:
+    def __init__(self, dim: int, hidden_dim: int, n_heads: int, k_kv_heads: int, norm_eps, max_context: int, linear: nn.Linear) -> None:
+        self.attention = Attention(dim, n_heads, max_context)
+        pass
+
+
+class Transformer:
+    def __init__(self, dim: int, hidden_dim: int, n_heads: int, n_layers: int) -> None:
+        self.layers = [TransformerBlock for _ in range(n_layers)]
+        print(self.layers)
+
+
+def build_transformer(model_path: Path):
+    model = Transformer(**MODEL_PARAMS["1B"]["args"])
+    return model
+
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", type=Path, help="Path to model")
+    parser.add_argument("--download", help="Need to download model?", default=False, action="store_true")
+    parser.add_argument("--temperature", help="Temperature", default=0.7, type=float)
+
+
+    args = parser.parse_args()
+    print("Standart args", args)
+    if args.download: subprocess.run("curl -O -L https://huggingface.co/bofenghuang/Meta-Llama-3-8B/resolve/main/original/tokenizer.model")
+    print("Standart", args.model)
+    assert args.model, "Please provide model via --model"
+    tokenizer = Tokenizer(model_path='./models/llama3-1b-instruct/tokenizer.model') # TODO add get model from param
+    tokens = tokenizer.encode('test some new text')
+    
+    print(f'Encoded text: {tokens}')
+    print(f"Decoded tokens: {tokenizer.decode(tokens)}")
+    print('True')
+    TEMPERATURE = args.temperature
+    print(f"seed = {Tensor._seed}\nTemperature = {TEMPERATURE}")
+    
+    model = build_transformer(model_path=args.model)
+    
