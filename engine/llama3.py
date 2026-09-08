@@ -30,6 +30,11 @@ MODEL_PARAMS = {
   },
 }
 
+def precompute_freqs_cis(dim:int, end:int, theta:float=10000.0) -> Tensor:
+    freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
+    freqs = Tensor.arange(end).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
+    return Tensor.stack(freqs.cos(), freqs.sin(), dim=-1).reshape(1, end, 1, dim//2, 2)
+
 def complex_mult(A, c, d):
     a,b = A[..., 0:1], A[..., 1:2]
     ro = a*c - b*d
@@ -55,6 +60,7 @@ def repeat_kv(x: Tensor, n_rep:int) -> Tensor:
 class Tokenizer:
     pat_str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
     def __init__(self, model_path: str) -> None:
+        print(f"{model_path=}")
         import tiktoken
         from tiktoken.load import load_tiktoken_bpe
         mergeable_ranks = load_tiktoken_bpe(model_path)
@@ -94,7 +100,7 @@ class Attention:
         self.max_content = max_content
 
         if os.getenv("WQKV", None): 
-            self.wqkv = linear(dim, self.n_heads*self.head_dim + self.n_kv_heads*self.head_dim * 2, bias=False)
+            self.wqkv = linear(dim, self.n_heads * self.head_dim + self.n_kv_heads * self.head_dim * 2, bias=False)
         else:
             self.wq = linear(dim, self.n_heads*self.head_dim, bias=False)
             self.wk = linear(dim, self.n_kv_heads*self.head_dim, bias=False)
@@ -142,37 +148,67 @@ class Attention:
             keys, values = xk, xv
         
         if self.max_content:
-            keys, velues = repeat_kv(keys, self.n_rep), repeat_kv(values, self.n_rep)
-            xq, keys, velues = xq.transpose(1, 2), keys.transpose(1,2), values.transpose(1,2)
+            keys, values = repeat_kv(keys, self.n_rep), repeat_kv(values, self.n_rep)
+            xq, keys, values = xq.transpose(1, 2), keys.transpose(1,2), values.transpose(1,2)
             attn = xq.scaled_dot_product_attention(keys, values, mask).transpose(1,2)
         else:
             xq,keys,values = xq.transpose(1,2), keys.transpose(1,2), values.transpose(1,2)
             attn = xq.scaled_dot_product_attention(keys, values, is_causal=True, enable_gqa=True).transpose(1,2)
         attn = attn.reshape(bsz, seqlen, -1)
         return self.wo(attn)
-        
-
-        
 
 
+class FeedForward:
+    def __init__(self, dim:int, hidden_dim:int, linear=nn.Linear) -> None:
+        self.w1 = linear(dim, hidden_dim, bias=False)
+        self.w2 = linear(hidden_dim, dim, bias=False)
+        self.w3 = linear(dim, hidden_dim, bias=False)
+    
+    def __call__(self, x:Tensor) -> Tensor:
+        w1 = self.w1(x).silu()
+        w3 = self.w3(x.contiguous_backward())
+        return self.w2(w1*w3)
 
 
 class TransformerBlock:
-    def __init__(self, dim: int, hidden_dim: int, n_heads: int, k_kv_heads: int, norm_eps, max_context: int, linear: nn.Linear) -> None:
+    def __init__(self, dim: int, hidden_dim: int, n_heads: int, k_kv_heads: int, norm_eps, max_context: int, linear: nn.Linear,
+                 feed_forward=FeedForward) -> None:
         self.attention = Attention(dim, n_heads, max_context)
-        pass
+        self.feed_forward = feed_forward(dim, hidden_dim, linear)
+        self.attention_norm = nn.RMSNorm(dim, norm_eps)
+        self.ffn_norm = nn.RMSNorm(dim, norm_eps)
+    
+    def __call__(self, x:Tensor, start_pos:Union[Variable,int], freqs_cis:Tensor, mask:Tensor|None):
+        h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
+        return (h+self.feed_forward(self.ffn_norm(h))).contiguous().contiguous_backward()
 
 
 class Transformer:
-    def __init__(self, dim: int, hidden_dim: int, n_heads: int, n_layers: int) -> None:
-        self.layers = [TransformerBlock for _ in range(n_layers)]
-        print(self.layers)
+    def __init__(self, dim: int, hidden_dim: int, n_heads: int, n_layers: int, n_kv_heads: int, norm_eps: float, rope_theta: int,
+                 vocab_size: int, max_context: int = 8192) -> None:
+        self.layers = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, max_context, linear=nn.Linear) for _ in range(n_layers)]
+        self.norm = nn.RMSNorm(dim, norm_eps)
+        self.tok_embeddings = nn.Embedding(vocab_size, dim)
+        self.output = nn.Linear(dim, vocab_size, bias=False)
+        self.max_context = max_context
+        self.freqs_cis = precompute_freqs_cis(dim // n_heads, max_context+2, rope_theta).contiguous().contiguous_backward()
+
+    def forward(self, tokens: Tensor, start_pos: Union[Variable, int], temperature: float = 0.2):
+        # 1 - tokens to vectors
+        _bsz, seqlen = tokens.shape
+        h = self.tok_embeddings(tokens).contiguous()
+        freqs_cis = self.freqs_cis.cast(h.dtype)[:, start_pos:start_pos+seqlen, :, :, :]
+        for l in self.layers:
+            h = l(h, start_pos, freqs_cis, None)
+        
+    
+    def __call__(self, tokens:Tensor, start_pos:int, ):
+        return self.forward(tokens, start_pos)
 
 
 def build_transformer(model_path: Path):
-    model = Transformer(**MODEL_PARAMS["1B"]["args"])
+    model = Transformer(**MODEL_PARAMS["8B"]["args"])
     return model
-
 
 
 if __name__ == "__main__":
@@ -183,18 +219,14 @@ if __name__ == "__main__":
 
 
     args = parser.parse_args()
-    print("Standart args", args)
     if args.download: subprocess.run("curl -O -L https://huggingface.co/bofenghuang/Meta-Llama-3-8B/resolve/main/original/tokenizer.model")
-    print("Standart", args.model)
     assert args.model, "Please provide model via --model"
-    tokenizer = Tokenizer(model_path='./models/llama3-1b-instruct/tokenizer.model') # TODO add get model from param
-    tokens = tokenizer.encode('test some new text')
+    tokenizer = Tokenizer(model_path=f"./{args.model}/tokenizer.model")
+    tokens = tokenizer.encode('tell me some joke')
     
-    print(f'Encoded text: {tokens}')
-    print(f"Decoded tokens: {tokenizer.decode(tokens)}")
-    print('True')
     TEMPERATURE = args.temperature
     print(f"seed = {Tensor._seed}\nTemperature = {TEMPERATURE}")
     
     model = build_transformer(model_path=args.model)
-    
+    output = model(Tensor([tokens]), 0)
+    print(f"{output=}")
