@@ -182,7 +182,7 @@ class TransformerBlock:
         h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
         return (h+self.feed_forward(self.ffn_norm(h))).contiguous().contiguous_backward()
 
-
+# TODO add a output 
 class Transformer:
     def __init__(self, dim: int, hidden_dim: int, n_heads: int, n_layers: int, n_kv_heads: int, norm_eps: float, rope_theta: int,
                  vocab_size: int, max_context: int = 8192) -> None:
@@ -198,10 +198,13 @@ class Transformer:
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens).contiguous()
         freqs_cis = self.freqs_cis.cast(h.dtype)[:, start_pos:start_pos+seqlen, :, :, :]
-        for l in self.layers:
-            h = l(h, start_pos, freqs_cis, None)
-        
-    
+        for l in self.layers: h = l(h, start_pos, freqs_cis, None)
+        logits = self.output(self.norm(h).contiguous().contiguous_backward()).contiguous_backward()
+        import math
+        if math.isnan(temperature): return logits
+        return logits.argmax() # TODO add sampling
+
+
     def __call__(self, tokens:Tensor, start_pos:int, ):
         return self.forward(tokens, start_pos)
 
@@ -226,7 +229,10 @@ if __name__ == "__main__":
     
     TEMPERATURE = args.temperature
     print(f"seed = {Tensor._seed}\nTemperature = {TEMPERATURE}")
-    
+
     model = build_transformer(model_path=args.model)
     output = model(Tensor([tokens]), 0)
+    print(f"{output.numpy()=}")
+    print(f"{tokenizer.decode([output.item()])=}")
     print(f"{output=}")
+    print(f"test decode {tokenizer.decode([91729])}")
