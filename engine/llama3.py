@@ -185,9 +185,9 @@ class FeedForward:
 
 
 class TransformerBlock:
-    def __init__(self, dim: int, hidden_dim: int, n_heads: int, k_kv_heads: int, norm_eps, max_context: int, linear: nn.Linear,
+    def __init__(self, dim: int, hidden_dim: int, n_heads: int, n_kv_heads: int, norm_eps, max_context: int, linear: nn.Linear,
                  feed_forward=FeedForward) -> None:
-        self.attention = Attention(dim, n_heads, max_context)
+        self.attention = Attention(dim, n_heads, max_context, n_kv_heads=n_kv_heads)
         self.feed_forward = feed_forward(dim, hidden_dim, linear)
         self.attention_norm = nn.RMSNorm(dim, norm_eps)
         self.ffn_norm = nn.RMSNorm(dim, norm_eps)
