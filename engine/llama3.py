@@ -38,7 +38,7 @@ def precompute_freqs_cis(dim:int, end:int, theta:float=10000.0) -> Tensor:
 def complex_mult(A, c, d):
     a,b = A[..., 0:1], A[..., 1:2]
     ro = a*c - b*d
-    co = a*b + b*c
+    co = a*d + b*c
     return ro.cat(co, dim=-1)
 
 def apply_rotate_emb(xq:Tensor, xk:Tensor, freqs_cis:Tensor) -> tuple[Tensor, Tensor]:
@@ -91,12 +91,26 @@ class Tokenizer:
     def decode(self, tokens: Sequence): return self.model.decode(tokens)
 
 
+def load(fn: str):
+    if fn.endswith('.index.json'):
+        with open(fn) as fp: weight_map = json.load(fp)['weight_map']
+        parts = {n:load(str(Path(fn).parent / Path(n).name)) for n in set(weight_map.values())}
+        return {k: parts[n][k] for k,n in weight_map.items()}
+    elif fn.endswith(".gguf"):
+        gguf_tensor = Tensor.empty(os.stat(fn).st_size, dtype=dtypes.uint8, device=f"disk:{fn}").to(Device.DEFAULT)
+        return gguf_load(gguf_tensor)[1]
+    elif fn.endswith(".safetensors"):
+        return safe_load(fn)
+    else:
+        torch_load(fn)
+
+
 class Attention:
-    def __init__(self, dim: int, n_heads: int, max_content=0, linear=nn.Linear, qk_norm: float | None = None) -> None:
+    def __init__(self, dim: int, n_heads: int, max_content=0, linear=nn.Linear, qk_norm: float | None = None, n_kv_heads: int = 8) -> None:
         self.n_heads = n_heads
-        self.n_kv_heads = n_heads
+        self.n_kv_heads = n_kv_heads
         self.head_dim = dim // n_heads # count params and count experts
-        self.n_rep = self.n_heads // self.n_heads # probably n_kv_heads
+        self.n_rep = self.n_heads // self.n_kv_heads # probably n_kv_heads
         self.max_content = max_content
 
         if os.getenv("WQKV", None): 
@@ -202,15 +216,23 @@ class Transformer:
         logits = self.output(self.norm(h).contiguous().contiguous_backward()).contiguous_backward()
         import math
         if math.isnan(temperature): return logits
-        return logits.argmax() # TODO add sampling
+        return logits[:, -1, :].flatten().argmax() # TODO add sampling
 
 
     def __call__(self, tokens:Tensor, start_pos:int, ):
         return self.forward(tokens, start_pos)
 
 
-def build_transformer(model_path: Path):
-    model = Transformer(**MODEL_PARAMS["8B"]["args"])
+def build_transformer(model_path: Path, model_size: str = "8B", load_weights: bool = True):
+    model = Transformer(**MODEL_PARAMS[model_size]["args"])
+    if not load_weights: return model
+    if model_path.is_dir():
+        if (model_path / "model.safetensors.index.json").exists(): weights = load(str(model_path / "model.safetensors.index.json"))
+    else:
+        weights = load(str(model_path))
+    # weights = fix_bf16(weights) # TODO
+    with Context(BEAM=0):
+        load_state_dict(model, weights, strict=False, consume=False)
     return model
 
 
@@ -219,6 +241,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=Path, help="Path to model")
     parser.add_argument("--download", help="Need to download model?", default=False, action="store_true")
     parser.add_argument("--temperature", help="Temperature", default=0.7, type=float)
+    parser.add_argument("--size", help="Model size", choices=["1B", "8B", "70B"], default="8B")
 
 
     args = parser.parse_args()
@@ -230,9 +253,9 @@ if __name__ == "__main__":
     TEMPERATURE = args.temperature
     print(f"seed = {Tensor._seed}\nTemperature = {TEMPERATURE}")
 
-    model = build_transformer(model_path=args.model)
-    output = model(Tensor([tokens]), 0)
-    print(f"{output.numpy()=}")
-    print(f"{tokenizer.decode([output.item()])=}")
-    print(f"{output=}")
+    model = build_transformer(model_path=args.model, model_size=args.size)
+    logits = model(Tensor([tokens]), 0)
+    print(f"{logits.numpy()=}")
+    print(f"{tokenizer.decode([logits.item()])=}")
+    print(f"{logits=}")
     print(f"test decode {tokenizer.decode([91729])}")
