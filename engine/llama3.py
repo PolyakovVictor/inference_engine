@@ -142,8 +142,8 @@ class Attention:
         if x.dtype == dtypes.bfloat16: xq, xk = xq.contiguous_backward(), xk.contiguous_backward()
 
         xq = xq.reshape(xq.shape[0], xq.shape[1], self.n_heads, self.head_dim)
-        xk = xk.reshape(xq.shape[0], xq.shape[1], self.n_heads, self.head_dim)
-        xv = xv.reshape(xq.shape[0], xq.shape[1], self.n_heads, self.head_dim)
+        xk = xk.reshape(xq.shape[0], xq.shape[1], self.n_kv_heads, self.head_dim)
+        xv = xv.reshape(xq.shape[0], xq.shape[1], self.n_kv_heads, self.head_dim)
 
         xq, xk = apply_rotate_emb(xq, xk, freqs_cis)
         bsz, seqlen, _, _ = xq.shape
