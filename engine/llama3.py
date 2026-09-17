@@ -57,6 +57,69 @@ def repeat_kv(x: Tensor, n_rep:int) -> Tensor:
     if n_rep == 1: return x
     return x.repeat((1,1,1,n_rep)).reshape(bs, seqlen, n_kv_heads * n_rep, head_dim)
 
+
+#default settings
+TEMPERATURE = 0.95
+TOP_K = 40
+TOP_P = 0.9
+ALPHA_F = 0.1
+ALPHA_P = 0.0
+
+last_seen_toks = []
+def prefill(model: Transformer, toks, start_pos:int=0):
+    global last_seen_toks
+    if start_pos == 0:
+        for i, (a,b) in enumerate(zip(toks, last_seen_toks)):
+            if a != b: break
+        else: i = min(len(toks), len(last_seen_toks))
+        start_pos += i
+        last_seen_toks = toks
+        toks = toks[i:]
+    # prefill the model
+    for tok in tqdm(toks):
+        GlobalCounters.reset()
+        model(Tensor([[tok]], device=Device.DEFAULT), start_pos, TEMPERATURE, TOP_K, TOP_P, ALPHA_F, ALPHA_P).realize() # mb change device
+        start_pos += 1
+    return start_pos
+
+
+def sample(logits: Tensor, temp:float, k:int, p:float, af:float, ap:float):
+    assert logits.ndim == 1, "only works on 1d tensors"
+    assert 0 <= p <= 1, "p must be between 0 and 1"
+    assert 0 <= k <= logits.numel(), "k must be between 0 and numel"
+
+    if temp < 1e-6: return logits.argmax()
+
+    logits = logits.to(Device.DEFAULT)
+
+    if af or ap:
+        if not hasattr(sample, "alpha_counter"):
+            setattr(sample, "alpha_counter", Tensor.zeros_like(logits, dtype=dtypes.int32).contiguous())
+        logits = logits - (sample.alpha_counter * af + (sample.alpha_counter > 0) * ap)
+    logits = (logits != logits).where(-float("inf"), logits)
+    t = (logits / temp).softmax()
+    counter, counter2 = Tensor.arange(t.numel()).contiguous(), Tensor.arange(t.numel() - 1, -1, -1).contiguous()
+    if k:
+        output, output_indices = Tensor.zeros(k, device=logits.device).contiguous(), Tensor.zeros(k, device=logits.device, dtype=dtypes.int32).contiguous()
+        for i in range(k):
+            t_argmax = (t.numel() - ((t == (t_max := t.max())) * counter2).max() - 1).cast(dtypes.default_int)
+            output = output + t_max.unsqueeze(0).pad(((i,k - i - 1),))
+            output_indices = output_indices + t_argmax.unsqueeze(0).pad(((i, k - i -1),))
+            t = (counter == t_argmax).where(0, t)
+        output_cumsum = output[::-1].cumsum()[::-1] + t.sum()
+        output = (output_cumsum >= (1 - p)) * output
+        output_indices = (output_cumsum >= (1 - p)) * output_indices
+
+        output_idx = output.multinomial()
+        output_token = output_indices[output_idx]
+    else:
+        output_token = t.multinomial()
+    
+    if af or ap:
+        sample.alpha_counter = (counter == output_token).where(sample.alpha_counter + 1, sample.alpha_counter)
+    return output_token
+    
+
 class Tokenizer:
     pat_str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
     def __init__(self, model_path: str) -> None:
@@ -86,7 +149,7 @@ class Tokenizer:
     @property
     def bos_id(self): return self.special_tokens["<|begin_of_text|>"]
     @property
-    def stop_tokens(self): return {self.special_tokens["<|end_of_text|>"], self.special_tokens["<|eot_id]>"]}
+    def stop_tokens(self): return {self.special_tokens["<|end_of_text|>"], self.special_tokens["<|eot_id|>"]}
     def encode(self, text: str): return self.model.encode(text=text)
     def decode(self, tokens: Sequence): return self.model.decode(tokens)
 
@@ -207,7 +270,8 @@ class Transformer:
         self.max_context = max_context
         self.freqs_cis = precompute_freqs_cis(dim // n_heads, max_context+2, rope_theta).contiguous().contiguous_backward()
 
-    def forward(self, tokens: Tensor, start_pos: Union[Variable, int], temperature: float = 0.2):
+    def forward(self, tokens: Tensor, start_pos: Union[Variable, int], temperature: float, top_k:int, 
+                top_p:float, alpha_f:float, alpha_p:float):
         # 1 - tokens to vectors
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens).contiguous()
@@ -216,11 +280,12 @@ class Transformer:
         logits = self.output(self.norm(h).contiguous().contiguous_backward()).contiguous_backward()
         import math
         if math.isnan(temperature): return logits
-        return logits[:, -1, :].flatten().argmax() # TODO add sampling
+        return sample(logits[:, -1, :].flatten(), temperature, top_k, top_p, alpha_f, alpha_p) # TODO add sampling
 
 
-    def __call__(self, tokens:Tensor, start_pos:int, ):
-        return self.forward(tokens, start_pos)
+    def __call__(self, tokens:Tensor, start_pos:int, temperature: float, top_k:float, 
+                top_p:float, alpha_f:float, alpha_p:float):
+        return self.forward(tokens, start_pos, temperature, top_k, top_p, alpha_f, alpha_p)
 
 
 def build_transformer(model_path: Path, model_size: str = "8B", load_weights: bool = True):
@@ -242,20 +307,55 @@ if __name__ == "__main__":
     parser.add_argument("--download", help="Need to download model?", default=False, action="store_true")
     parser.add_argument("--temperature", help="Temperature", default=0.7, type=float)
     parser.add_argument("--size", help="Model size", choices=["1B", "8B", "70B"], default="8B")
+    parser.add_argument("--profile", action="store_true", help="Output profile data")
+    parser.add_argument("--timing", action="store_true", help="Print timing per token")
 
 
     args = parser.parse_args()
     if args.download: subprocess.run("curl -O -L https://huggingface.co/bofenghuang/Meta-Llama-3-8B/resolve/main/original/tokenizer.model")
     assert args.model, "Please provide model via --model"
     tokenizer = Tokenizer(model_path=f"./{args.model}/tokenizer.model")
-    tokens = tokenizer.encode('tell me some joke')
-    
+    def encode_role(role: str): return [tokenizer.special_tokens["<|start_header_id|>"]] + tokenizer.encode(role) + [tokenizer.special_tokens["<|end_header_id|>"]]
+    def encode_message(role: str, text: str): return  encode_role(role) + tokenizer.encode(text.strip()) + [tokenizer.special_tokens["<|eot_id|>"]]
+    print(f"{tokenizer.bos_id=}")
+    # tokens = tokenizer.encode('tell me some joke')
+    model = build_transformer(model_path=args.model, model_size=args.size)
+
     TEMPERATURE = args.temperature
     print(f"seed = {Tensor._seed}\nTemperature = {TEMPERATURE}")
+    param_bytes = sum(x.nbytes() for x in get_parameters(model))
 
-    model = build_transformer(model_path=args.model, model_size=args.size)
-    logits = model(Tensor([tokens]), 0)
-    print(f"{logits.numpy()=}")
-    print(f"{tokenizer.decode([logits.item()])=}")
-    print(f"{logits=}")
-    print(f"test decode {tokenizer.decode([91729])}")
+    max_new_token = 99
+    generated = 0
+    ### generation
+    while True:
+        tokens = encode_message("user", input("Q: ")) + encode_role("assistant")
+
+        start_pos = prefill(model, tokens[:-1], start_pos=0)
+        last_tok = tokens[-1]
+        while True:
+            GlobalCounters.reset()
+            st = GlobalCounters.time_sum_s
+            with Profiling(enabled=args.profile):
+                with Timing("total ", enabled=True, on_exit=lambda x: f", {1e9/x:.2f} tok/s, {GlobalCounters.global_mem/x:.2f} GB/s, param {param_bytes/x:.2f} GB/s"):
+                    with Timing("enqueue in ", on_exit=(lambda et: (f", {(GlobalCounters.time_sum_s-st)*1e3:.2f} ms on {Device.DEFAULT}" if DEBUG>=2 else "")+
+                        f", {GlobalCounters.global_ops*1e-9:.2f} GOPS, {GlobalCounters.global_mem*1e-9:.2f} GB"+
+                        (f", {GlobalCounters.global_mem*1e-9/(GlobalCounters.time_sum_s-st):.2f} GB/s, param {param_bytes*1e-9/(GlobalCounters.time_sum_s-st):.2f} GB/s" if DEBUG>=2 else "")) if DEBUG else None, enabled=args.timing):
+                        tok = model(Tensor([[last_tok]], device=Device.DEFAULT), start_pos=start_pos, temperature=TEMPERATURE, 
+                                    top_k=TOP_K, top_p=TOP_P, alpha_f=ALPHA_F, alpha_p=ALPHA_P)
+                        print(f"{tok=}")
+                    tok = tok.item()
+            start_pos += 1
+            last_tok = tok
+            generated += 1
+            if tok in tokenizer.stop_tokens or generated >= max_new_token: break
+
+            print(f"{start_pos=}")
+            print(tokenizer.decode([tok]), end="", flush=True)
+        print(flush=True)
+
+            # logits = model(Tensor([tokens]), 0)
+            # print(f"{logits.numpy()=}")
+            # print(f"{tokenizer.decode([logits.item()])=}")
+            # print(f"{logits=}")
+            # print(f"test decode {tokenizer.decode([91729])}")
