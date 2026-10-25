@@ -1,7 +1,7 @@
-import subprocess
+import subprocess, collections
 
 from pathlib import Path
-from typing import List, Sequence, Union
+from typing import List, Sequence, Union, Any
 import json, argparse, random, time, os
 # from extra.models.llama import Transformer, convert_from_huggingface, convert_from_gguf, fix_bf16
 from tinygrad.llm.gguf import gguf_load
@@ -29,6 +29,70 @@ MODEL_PARAMS = {
     "files": 191
   },
 }
+
+
+def convert_from_huggingface(weights:dict[str, Tensor], n_layers: int, n_heads: int, n_kv_heads: int, permute_layers: bool = True, quantize: bool = False):
+  # huggingface stores Q and K permuted! it is mostly correct without this, but without it makes RoPE different, so it will diverge after 10+ toks.
+  def permute(v: Tensor, n_heads: int):
+    return v.reshape(n_heads, 2, v.shape[0] // n_heads // 2, v.shape[1] if len(v.shape) > 1 else 1).transpose(1, 2).reshape(*v.shape[:2]) # transpose change the axis shape(0,1,2) -> shape(1,0,2)
+
+  keymap = {
+    "model.embed_tokens.weight": "tok_embeddings.weight",
+    **{f"model.layers.{l}.input_layernorm.weight": f"layers.{l}.attention_norm.weight" for l in range(n_layers)},
+    **{f"model.layers.{l}.self_attn.{x}_norm.weight": f"layers.{l}.attention.{x}_norm.weight" for x in ["q", "k"] for l in range(n_layers)},
+    **{f"model.layers.{l}.self_attn.{x}_proj.weight": f"layers.{l}.attention.w{x}.weight" for x in ["q", "k", "v", "o"] for l in range(n_layers)},
+    **{f"model.layers.{l}.self_attn.{x}_proj.bias": f"layers.{l}.attention.w{x}.bias" for x in ["q", "k", "v", "o"] for l in range(n_layers)},
+    **{f"model.layers.{l}.post_attention_layernorm.weight": f"layers.{l}.ffn_norm.weight" for l in range(n_layers)},
+    **{f"model.layers.{l}.mlp.{x}_proj.weight": f"layers.{l}.feed_forward.w{y}.weight" for x, y in {"gate": "1", "down": "2", "up": "3"}.items() for l in range(n_layers)},
+    **{f"model.layers.{l}.mlp.gate.weight": f"layers.{l}.feed_forward.gate.weight" for l in range(n_layers)},
+    "model.norm.weight": "norm.weight",
+    "lm_head.weight": "output.weight",
+  }
+  sd = {}
+  experts = collections.defaultdict(dict)
+  for k, v in weights.items():
+    if ".rotary_emb." in k: continue
+    # v = v.to(Device.DEFAULT)
+    if "model.layers" in k:
+      if ("q_proj" in k or "q_norm" in k) and permute_layers: v = permute(v.to(Device.DEFAULT), n_heads)
+      elif ("k_proj" in k or "k_norm" in k) and permute_layers: v = permute(v.to(Device.DEFAULT), n_kv_heads)
+    if '.mlp.experts.' in k:
+      # support MoE models
+      _, _, layer, _, _, expert, name, _ = k.split('.')
+      experts[f'layers.{layer}.feed_forward.{name}'][int(expert)] = v
+      continue
+    name = keymap[k]
+    if quantize and k.startswith("model.layers") and k.endswith("_proj.weight"):
+        sd[name], sd[name.replace(".weight", ".scale")] = quintize_tensor(v)
+    else:
+        sd[name] = v.to(Device.DEFAULT).cast(dtypes.float16).realize()
+  for k,v in experts.items(): sd[k] = Tensor.stack(*[v[i] for i in range(len(v))])
+
+  # Handle tied embeddings (e.g., Llama 3.2 1B Instruct where lm_head shares weights with embed_tokens)
+  if "output.weight" not in sd and "tok_embeddings.weight" in sd:
+    sd["output.weight"] = sd["tok_embeddings.weight"]
+
+  return sd
+
+def convert_from_gguf(weights:dict[str, Tensor], n_layers:int):
+  keymap = {
+    "token_embd.weight": "tok_embeddings.weight",
+    **{f"blk.{l}.attn_norm.weight": f"layers.{l}.attention_norm.weight" for l in range(n_layers)},
+    **{f"blk.{l}.attn_{x}.weight": f"layers.{l}.attention.w{x}.weight" for x in ["q", "k", "v"] for l in range(n_layers)},
+    **{f"blk.{l}.attn_output.weight": f"layers.{l}.attention.wo.weight" for l in range(n_layers)},
+    **{f"blk.{l}.ffn_norm.weight": f"layers.{l}.ffn_norm.weight" for l in range(n_layers)},
+    **{f"blk.{l}.ffn_{x}.weight": f"layers.{l}.feed_forward.w{y}.weight" for x, y in {"gate": "1", "down": "2", "up": "3"}.items() for l in range(n_layers)},
+    "output_norm.weight": "norm.weight",
+    "rope_freqs.weight": "rope_freqs.weight",
+  }
+  sd = {keymap[k]: v for k,v in weights.items()}
+  sd["output.weight"] = weights["token_embd.weight"]
+  return sd
+
+def fix_bf16(weights:dict[Any, Tensor]):
+  # TODO: without casting to float16, 70B llama OOM on tinybox.
+  return {k:v.cast(dtypes.float32).cast(dtypes.float16) if v.dtype == dtypes.bfloat16 else v for k,v in weights.items()}
+
 
 def precompute_freqs_cis(dim:int, end:int, theta:float=10000.0) -> Tensor:
     freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
@@ -168,6 +232,24 @@ def load(fn: str):
         torch_load(fn)
 
 
+class Int8Linear:
+    def __init__(self, in_features, out_features, bias=False) -> None:
+        assert not bias
+        self.weight = Tensor.ones(out_features, in_features, dtype=dtypes.int8)
+        self.scale = Tensor.ones(out_features, dtype=dtypes.float16)
+    def __call__(self, x: Tensor) -> Any: return x.dot(self.weight.cast(dtypes.float16).T * self.scale)
+
+
+def quintize_tensor(v: Tensor):
+    v = v.to(Device.DEFAULT).cast(dtypes.float32).contiguous()
+    # v = v.cast(dtypes.float16).contiguous()
+    scale = (v.abs().max(axis=1) / 127.0).maximum(1e-8).contiguous().realize()
+    qf = (v / scale.unsqueeze(1)).round().clip(-127,127).contiguous().realize()
+    # q = (v / scale.unsqueeze(1)).round().clip(-127,127).cast(dtypes.int8)
+    q = qf.cast(dtypes.int8).contiguous().realize()
+    return q, scale.cast(dtypes.float16).contiguous().realize()
+
+
 class Attention:
     def __init__(self, dim: int, n_heads: int, max_content=0, linear=nn.Linear, qk_norm: float | None = None, n_kv_heads: int = 8) -> None:
         self.n_heads = n_heads
@@ -248,9 +330,9 @@ class FeedForward:
 
 
 class TransformerBlock:
-    def __init__(self, dim: int, hidden_dim: int, n_heads: int, n_kv_heads: int, norm_eps, max_context: int, linear: nn.Linear,
+    def __init__(self, dim: int, hidden_dim: int, n_heads: int, n_kv_heads: int, norm_eps, max_context: int, linear,
                  feed_forward=FeedForward) -> None:
-        self.attention = Attention(dim, n_heads, max_context, n_kv_heads=n_kv_heads)
+        self.attention = Attention(dim, n_heads, max_context, n_kv_heads=n_kv_heads, linear=linear)
         self.feed_forward = feed_forward(dim, hidden_dim, linear)
         self.attention_norm = nn.RMSNorm(dim, norm_eps)
         self.ffn_norm = nn.RMSNorm(dim, norm_eps)
@@ -262,8 +344,8 @@ class TransformerBlock:
 # TODO add a output 
 class Transformer:
     def __init__(self, dim: int, hidden_dim: int, n_heads: int, n_layers: int, n_kv_heads: int, norm_eps: float, rope_theta: int,
-                 vocab_size: int, max_context: int = 8192) -> None:
-        self.layers = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, max_context, linear=nn.Linear) for _ in range(n_layers)]
+                 vocab_size: int, linear: nn.Linear = nn.Linear, max_context: int = 8192) -> None:
+        self.layers = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, max_context, linear=linear) for _ in range(n_layers)]
         self.norm = nn.RMSNorm(dim, norm_eps)
         self.tok_embeddings = nn.Embedding(vocab_size, dim)
         self.output = nn.Linear(dim, vocab_size, bias=False)
@@ -288,16 +370,20 @@ class Transformer:
         return self.forward(tokens, start_pos, temperature, top_k, top_p, alpha_f, alpha_p)
 
 
-def build_transformer(model_path: Path, model_size: str = "8B", load_weights: bool = True):
-    model = Transformer(**MODEL_PARAMS[model_size]["args"])
+def build_transformer(model_path: Path, model_size: str = "8B", load_weights: bool = True, quantize: bool = True, max_context: int = 2048):
+    model = Transformer(**MODEL_PARAMS[model_size]["args"], linear=Int8Linear if quantize else nn.Linear, max_context=max_context)
     if not load_weights: return model
     if model_path.is_dir():
         if (model_path / "model.safetensors.index.json").exists(): weights = load(str(model_path / "model.safetensors.index.json"))
     else:
         weights = load(str(model_path))
-    # weights = fix_bf16(weights) # TODO
+    if "model.embed_tokens.weight" in weights:
+        weights = convert_from_huggingface(weights, MODEL_PARAMS[model_size]["args"]["n_layers"], MODEL_PARAMS[model_size]["args"]["n_heads"], MODEL_PARAMS[model_size]["args"]["n_kv_heads"], quantize=quantize)
+    elif "token_embd.weight" in weights:
+        weights = convert_from_gguf(weights, MODEL_PARAMS[model_size]["args"]["n_layers"])
+    weights = fix_bf16(weights) # TODO
     with Context(BEAM=0):
-        load_state_dict(model, weights, strict=False, consume=False)
+        load_state_dict(model, weights, strict=False, consume=True)
     return model
 
 
@@ -309,17 +395,18 @@ if __name__ == "__main__":
     parser.add_argument("--size", help="Model size", choices=["1B", "8B", "70B"], default="8B")
     parser.add_argument("--profile", action="store_true", help="Output profile data")
     parser.add_argument("--timing", action="store_true", help="Print timing per token")
+    parser.add_argument("--quantize", action="store_true", help="Use quantize", default=False)
 
 
     args = parser.parse_args()
-    if args.download: subprocess.run("curl -O -L https://huggingface.co/bofenghuang/Meta-Llama-3-8B/resolve/main/original/tokenizer.model")
+    if args.download: subprocess.run("curl -O -L https://huggingface.co/bofenghuang/Meta-Llama-3-1B/resolve/main/original/tokenizer.model")
     assert args.model, "Please provide model via --model"
     tokenizer = Tokenizer(model_path=f"./{args.model}/tokenizer.model")
     def encode_role(role: str): return [tokenizer.special_tokens["<|start_header_id|>"]] + tokenizer.encode(role) + [tokenizer.special_tokens["<|end_header_id|>"]]
     def encode_message(role: str, text: str): return  encode_role(role) + tokenizer.encode(text.strip()) + [tokenizer.special_tokens["<|eot_id|>"]]
-    print(f"{tokenizer.bos_id=}")
+    print(f"{tokenizer.bos_id=} {args.quantize=}")
     # tokens = tokenizer.encode('tell me some joke')
-    model = build_transformer(model_path=args.model, model_size=args.size)
+    model = build_transformer(model_path=args.model, model_size=args.size, quantize=args.quantize)
 
     TEMPERATURE = args.temperature
     print(f"seed = {Tensor._seed}\nTemperature = {TEMPERATURE}")
